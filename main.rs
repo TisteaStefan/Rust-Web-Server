@@ -1,247 +1,412 @@
-use nix::libc::{siginfo_t, EXIT_SUCCESS};
-use std::error::Error;
-use std::fs::File;
-use std::io::{self, Read};
-use std::os::raw::{c_int, c_void};
-use object::{Object, ObjectSegment};
-use nix::sys::signal::{sigaction, SigAction, SigHandler, SigSet, SaFlags};
-use nix::sys::mman::{mmap, MapFlags, ProtFlags};
-use nix::unistd::sysconf;
-use nix::unistd::SysconfVar;
+use std::env;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command;
+use std::process::Stdio;
 
-mod runner;
-
-// Signal handler context
-struct SegmentationContext {
-    // Segments
-    segments: Vec<(u64, u64, u64, u64, object::SegmentFlags)>,
-}
-
-impl SegmentationContext {
-    // Create a new segmentation context
-    fn new(segments: Vec<(u64, u64, u64, u64, object::SegmentFlags)>) -> Self {
-        SegmentationContext { segments }
-    }
-
-    fn handle_segv(&self, address: usize) -> bool {
-        let page_size = sysconf(SysconfVar::PAGE_SIZE).unwrap().unwrap() as usize;
-        // Find the segment that contains the address
-        for segment in &self.segments {
-            // Check if the address is within the segment
-            if address >= segment.0 as usize && address < (segment.0 + segment.1) as usize {
-                let page_start = address & !(page_size - 1);
-                let segment_offset = page_start as u64 - segment.0;
-                let length = (segment.1 - segment_offset).min(page_size as u64);
-                let prot = segment_flags_to_prot_flags(segment.4);
-
-                /* 
-                eprintln!(
-                    "Mapping page at address {:#x} with length {:#x} and protection {:?}",
-                    page_start, length, prot
-                );
-                */
-
-                // Map the page
-                unsafe {
-                    if mmap(
-                        page_start as *mut c_void,
-                        length as usize,
-                        prot,
-                        MapFlags::MAP_FIXED | MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-                        -1,
-                        0,
-                    ).is_ok() {
-                        return true;
-                    } else {
-                        eprintln!("mmap failed at address {:#x} with length {:#x} and protection {:?}", page_start, length, prot);
-                    }
-                }
-            }
-        }
-        false
-    }
-}
-
-extern "C" fn sigsegv_handler(_signal: c_int, siginfo: *mut siginfo_t, _extra: *mut c_void) {
-    let address = unsafe { (*siginfo).si_addr() } as usize;
-    //eprintln!("Segmentation fault at address: {:#x}", address);
-
-    // Handle the segmentation fault
-    let handler = |address: usize| -> bool {
-        unsafe {
-            if let Some(context) = CONTEXT.as_ref() {
-                return context.handle_segv(address);
-            }
-        }
-        false
-    };
-
-    if !handler(address) {
-        //eprintln!("Failed to handle segmentation fault at address: {:#x}", address);
-        std::process::exit(0);  // Exiting with 0 to satisfy the grader
-    }
-    
-    std::process::exit(0);  // Exiting with 0 to satisfy the grader
-}
-
-fn segment_flags_to_prot_flags(flags: object::SegmentFlags) -> ProtFlags {
-    // Convert the segment flags to protection flags
-    let mut prot_flags = ProtFlags::empty();
-
-    // Parse the flags
-    if let object::SegmentFlags::Elf { p_flags } = flags {
-        if p_flags & 0x1 != 0 { prot_flags |= ProtFlags::PROT_EXEC; }
-        if p_flags & 0x2 != 0 { prot_flags |= ProtFlags::PROT_WRITE; }
-        if p_flags & 0x4 != 0 { prot_flags |= ProtFlags::PROT_READ; }
-    }
-    prot_flags
-}
-
-fn read_segments(filename: &str) -> Result<Vec<(u64, u64, u64, u64, object::SegmentFlags)>, Box<dyn Error>> {
-    eprintln!("Segments");
-    eprintln!("# address size offset length flags");
-
-    // Read the object file
-    let mut file = File::open(filename)?;
-    let mut buffer = Vec::new();
-    // Read the file into the buffer
-    file.read_to_end(&mut buffer)?;
-
-    // Parse the object file
-    let obj_file = object::File::parse(&*buffer)?;
-
-    let page_size = sysconf(SysconfVar::PAGE_SIZE).unwrap().unwrap() as usize;
-
-    // Collect the segments
-    let segments: Vec<(u64, u64, u64, u64, object::SegmentFlags)> = obj_file
-        .segments()
-        .map(|segment| {
-            let address = segment.address();
-            let size = segment.size();
-            let (offset, length) = segment.file_range();
-            let flags = segment.flags();
-
-            // Adjust address and offset to be page-aligned
-            let aligned_addr = address & !(page_size as u64 - 1);
-            let aligned_offset = offset & !(page_size as u64 - 1);
-            let adjusted_size = size + (address - aligned_addr);
-
-            (
-                aligned_addr,
-                adjusted_size,
-                aligned_offset,
-                length,
-                flags,
-            )
-        })
-        .collect();
-
-    Ok(segments)
-}
-
-fn print_segments(segments: &[(u64, u64, u64, u64, object::SegmentFlags)]) {
-    //eprintln!("Segments");
-    // Print the segments
-    for (i, segment) in segments.iter().enumerate() {
-        eprintln!(
-            "{}\t{:#x}\t{}\t{:#x}\t{}\t{}",
-            i,
-            segment.0,
-            segment.1,
-            segment.2,
-            segment.3,
-            parse_flags(&segment.4)
-        );
-    }
-}
-
-fn parse_flags(flags: &object::SegmentFlags) -> String {
-    // Parse the flags
-    if let object::SegmentFlags::Elf { p_flags } = flags {
-        let read = if p_flags & 0x4 != 0 { "r" } else { "-" };
-        let write = if p_flags & 0x2 != 0 { "w" } else { "-" };
-        let execute = if p_flags & 0x1 != 0 { "x" } else { "-" };
-        // Return the flags
-        format!("{}{}{}", read, write, execute)
-    } else {
-        "???".to_string()
-    }
-}
-
-fn print_entry_point(entry_point: u64) {
-    // Print the entry point
-    eprintln!("Entry point {:x}", entry_point);
-}
-
-fn print_base_address(base_address: u64) {
-    // Print the base address
-    eprintln!("Base address {:x}", base_address);
-}
-
-fn determine_entry_point(filename: &str) -> Result<u64, Box<dyn Error>> {
-    // Read the object file
-    let mut file = File::open(filename)?;
-    let mut buffer = Vec::new();
-    // Read the file into the buffer
-    file.read_to_end(&mut buffer)?;
-    let obj_file = object::File::parse(&*buffer)?;
-    Ok(obj_file.entry())
-}
-
-fn determine_base_address(segments: &[(u64, u64, u64, u64, object::SegmentFlags)]) -> u64 {
-    // Find the minimum address
-    segments.iter().map(|s| s.0).min().unwrap_or(0)
-}
-
-fn register_sigsegv_handler() -> Result<(), Box<dyn Error>> {
-    // Register the signal handler
-    let sig_action = SigAction::new(
-        SigHandler::SigAction(sigsegv_handler),
-        SaFlags::SA_SIGINFO,
-        SigSet::empty(),
-    );
-    unsafe {
-        sigaction(nix::sys::signal::Signal::SIGSEGV, &sig_action)?;
-    }
-    Ok(())
-}
-
-static mut CONTEXT: Option<SegmentationContext> = None;
-
-fn exec(filename: &str) -> Result<(), Box<dyn Error>> {
-    // Read segments
-    let segments = read_segments(filename)?;
-
-    // Initialize the context
-    unsafe {
-        CONTEXT = Some(SegmentationContext::new(segments.clone()));
-    }
-
-    // Print segments
-    print_segments(&segments);
-
-    let entry_point = determine_entry_point(filename)?;
-    print_entry_point(entry_point);
-
-    let base_address = determine_base_address(&segments);
-    print_base_address(base_address);
-
-    register_sigsegv_handler()?;
-
-    Ok(runner::exec_run(base_address as usize, entry_point as usize))
-
-    
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <path-to-executable>", args[0]);
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    // Parse command-line arguments
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 3 {
+        eprintln!("Usage: {} <port> <root_folder>", args[0]);
         std::process::exit(1);
     }
 
-    // Execute the program
-    exec(&args[1])?;
+    // Extract port number and root folder from command-line arguments
+    let port = args[1].parse::<u16>().expect("Invalid port number");
+    let root_folder = PathBuf::from(&args[2]);
+
+    // Print startup information
+    println!("Root folder: {}", root_folder.display());
+    println!("Server listening on 0.0.0.0:{}", port);
+
+    // Start TCP listener
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port))?;
+    loop {
+        // Accept incoming connections
+        let (stream, _) = listener.accept()?;
+        let root_folder = root_folder.clone();
+
+        // Handle each connection in a separate asynchronous task
+        tokio::spawn(async move {
+            if let Err(e) = connection(stream, root_folder).await {
+                eprintln!("Error handling connection: {}", e);
+            }
+        });
+    }
+}
+
+/// Asynchronously handle each incoming TCP connection.
+async fn connection(mut stream: TcpStream, root_folder: PathBuf) -> io::Result<()> {
+    // Read HTTP request
+    let mut buffer = [0; 1024];
+    stream.read(&mut buffer)?;
+    let request = String::from_utf8_lossy(&buffer[..]).to_string();
+    let lines: Vec<&str> = request.lines().collect();
+
+    // Parse the HTTP request
+    let (method, path, query, headers) = {
+        // Split request lines
+        let lines: Vec<&str> = request.lines().collect();
+        if lines.is_empty() {
+            ("".to_string(), "".to_string(), None, vec![])
+        } else {
+            // Split the request line into method, path, and HTTP version
+            let mut parts = lines[0].split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let mut path = parts.next().unwrap_or("").to_string();
+            let _http_version = parts.next().unwrap_or(""); // Not used
+
+            // Check if the path contains a query string
+            let query = if let Some(index) = path.find('?') {
+                let query = path.split_off(index + 1);
+                path.pop();
+                Some(query)
+            } else {
+                None
+            };
+
+            // Parse headers
+            let mut headers = vec![];
+            for line in lines.iter().skip(1) {
+                if let Some((key, value)) = parse_header_line(line) {
+                    headers.push((key, value));
+                }
+            }
+
+            (method, path, query, headers)
+        }
+    };
+
+    // Delegate to the appropriate handler based on the HTTP method
+    match method.as_str() {
+        "GET" => get( &mut stream, &root_folder, &path, query, &headers).await, 
+        "POST" => post(&mut stream, &root_folder, &path, &request).await,
+        _ => {
+            println!("{} 127.0.0.1 {} -> 405 (Method Not Allowed)", method, path);
+            let response = b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n<html>405 Method Not Allowed</html>";
+            stream.write_all(response)?;
+            Ok(())
+        }
+    }
+}
+
+// Asynchronous function to handle GET requests
+async fn get(
+    stream: &mut TcpStream,
+    root_folder: &Path,
+    path: &str,
+    query: Option<String>,
+    headers: &[(String, String)], // Add headers parameter
+) -> io::Result<()> {
+
+    // Construct the full path to the requested file
+    let full_path = root_folder.join(&path[1..]); // Remove the leading '/' from the path
+
+    // Check if the requested path is forbidden
+    if path.starts_with("/..") || path.starts_with("/forbidden") {
+        println!("GET 127.0.0.1 {} -> 403 (Forbidden)", path);
+        let response = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n<html>403 Forbidden</html>";
+        stream.write_all(response)?;
+        return Ok(());
+    }
+
+    // Handle scripts in the /scripts/ directory
+    if path.starts_with("/scripts/") {
+        match execute_script(&full_path, &query, path, "GET", headers).await { // Pass headers
+            Ok(response) => stream.write_all(&response)?,
+            Err(_) => {
+                println!("GET 127.0.0.1 {} -> 500 (Internal Server Error)", path);
+                let response =
+                    b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n<html>500 Internal Server Error</html>";
+                stream.write_all(response)?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Serve static files if the path is not forbidden and not in /scripts/
+    if full_path.is_file() {
+        // Read the file contents
+        let contents = fs::read(&full_path)?;
+
+        // Determine the content type of the file
+        let content_type = content_type(&full_path);
+
+        // Construct the HTTP response
+        println!("GET 127.0.0.1 {} -> 200 (OK)", path);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            content_type,
+            contents.len(),
+        );
+        
+        // Write the response header
+        stream.write_all(response.as_bytes())?;
+        
+        // Write the file contents
+        stream.write_all(&contents)?;
+    } else {
+        // File not found
+        println!("GET 127.0.0.1 {} -> 404 (Not Found)", path);
+        let response = b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n<html>404 Not Found</html>";
+        stream.write_all(response)?;
+    }
 
     Ok(())
+}
+
+// Function to execute scripts located in /scripts/ directory
+async fn execute_script(
+    script_path: &Path,
+    query: &Option<String>,
+    path: &str,
+    method: &str,
+    headers: &[(String, String)], // Add headers parameter
+) -> io::Result<Vec<u8>> {
+    if script_path.is_file() {
+        let mut cmd = Command::new(&script_path);
+
+        // Set environment variables from query parameters
+        if let Some(query_string) = query {
+            let query_pairs = query_string.split('&').map(|pair| {
+                let mut split = pair.split('=');
+                (
+                    split.next().unwrap_or("").to_string(),
+                    split.next().unwrap_or("").to_string(),
+                )
+            });
+
+            for (key, value) in query_pairs {
+                let env_var = format!("Query_{}", key);
+                cmd.env(env_var, value);
+            }
+        }
+
+        // Set environment variables from headers
+        for (key, value) in headers {
+            cmd.env(key, value);
+        }
+
+        cmd.env("Method", method);
+        cmd.env("Path", path);
+
+        let output = if method == "GET" {
+            cmd.stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .expect("Failed to execute script")
+        } else {
+            unimplemented!("Handle non-GET method body handling here");
+        };
+
+        if output.status.success() {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            let (headers, body_start_index) = parse_headers(&output_str);
+            let body = output_str.lines().skip(body_start_index).collect::<Vec<_>>().join("\n");
+            let content_type = headers.iter().find(|&&(ref k, _)| k == "Content-type")
+                .map(|&(_, ref v)| v.clone())
+                .unwrap_or_else(|| "text/plain".to_string());
+            let content_length = headers.iter().find(|&&(ref k, _)| k == "Content-length")
+                .map(|&(_, ref v)| v.clone())
+                .unwrap_or_else(|| body.len().to_string());
+
+            println!("{} 127.0.0.1 {} -> 200 (OK)", method, path);
+
+            Ok(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                content_type, content_length, body
+            ).as_bytes().to_vec())
+        } else {
+            println!("{} 127.0.0.1 {} -> 500 (Internal Server Error)", method, path);
+            Ok(b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n<html>500 Internal Server Error</html>".to_vec())
+        }
+    } else {
+        println!("{} 127.0.0.1 {} -> 404 (Not Found)", method, path);
+        Ok(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n<html>404 Not Found</html>".to_vec())
+    }
+}
+
+
+// Determine the content type based on file extension
+fn content_type(file_path: &Path) -> &'static str {
+    match file_path.extension().and_then(|ext| ext.to_str()) {
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("jpg") => "image/jpeg",
+        Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+// Asynchronous function to handle POST requests
+async fn post(
+    stream: &mut TcpStream,
+    root_folder: &PathBuf,
+    path: &str,
+    request: &str,
+) -> io::Result<()> {
+    let full_path = root_folder.join(&path[1..]);
+
+    if full_path.is_file() {
+        let mut cmd = Command::new(&full_path);
+
+        // Extract request body to pass as input to script
+        let body = extract_request_body(request);
+
+        // Extract query string and set as environment variables
+        if let Some(query) = extract_query_string(request) {
+            let query_pairs = query.split('&').map(|pair| {
+                let mut split = pair.split('=');
+                (
+                    format!("Query_{}", split.next().unwrap_or("")),
+                    split.next().unwrap_or("").to_string(),
+                )
+            });
+            for (key, value) in query_pairs {
+                cmd.env(key, value);
+            }
+        }
+
+        // Additional environment variables required by the script
+        cmd.env("Method", "POST");
+        cmd.env("Path", path);
+
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to execute script");
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(body.as_bytes()).await?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .expect("Failed to read stdout");
+
+        if output.status.success() {
+            // Parse the output and headers from the script
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            let (headers, body_start_index) = parse_headers(&output_str);
+
+            // Find the start of the actual body content
+            let body_content = output_str.lines().skip(body_start_index).collect::<Vec<_>>().join("\n");
+
+            // Trim any trailing null terminators from the body content
+            let trimmed_body = body_content.trim_end_matches(char::from(0));
+
+            let content_type = headers
+                .iter()
+                .find(|&&(ref k, _)| k.to_lowercase() == "content-type")
+                .map(|&(_, ref v)| v.clone())
+                .unwrap_or_else(|| "text/plain".to_string());
+
+            let content_length = trimmed_body.len(); // Calculate the trimmed body length
+
+            println!("POST 127.0.0.1 {} -> 200 (OK)", path);
+
+            // Construct the HTTP response
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                content_type, content_length, trimmed_body
+            );
+
+            // Write the response to the stream
+            stream.write_all(response.as_bytes())?;
+        } else {
+            println!("POST 127.0.0.1 {} -> 500 (Internal Server Error)", path);
+            let response = b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n<html>500 Internal Server Error</html>";
+            stream.write_all(response)?;
+        }
+    } else {
+        println!("POST 127.0.0.1 {} -> 404 (Not Found)", path);
+        let response = b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n<html>404 Not Found</html>";
+        stream.write_all(response)?;
+    }
+
+    Ok(())
+}
+
+// Function to extract request body from the HTTP request
+fn extract_request_body(request: &str) -> String {
+
+    // Find the start of the body after headers
+    if let Some(start_index) = request.find("\r\n\r\n") {
+        let body_start = start_index + 4; // Skip "\r\n\r\n"
+        request[body_start..].to_string()
+    } else {
+        String::new()
+    }
+}
+
+// Function to extract query string from the HTTP request
+fn extract_query_string(request: &str) -> Option<&str> {
+    
+    // Find the start of the request line
+    if let Some(start_index) = request.find("\r\n") {
+        let request_line = &request[..start_index];
+
+        // Find the start of the query string (after the method and path)
+        if let Some(path_index) = request_line.find(' ') {
+            if let Some(query_start) = request_line[path_index..].find('?') {
+                let query_start = path_index + query_start + 1; // Skip '?'
+                if let Some(query_end) = request_line[query_start..].find(' ') {
+                    return Some(&request_line[query_start..query_start + query_end]);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+// Function to parse headers from the script output
+fn parse_headers(response: &str) -> (Vec<(String, String)>, usize) {
+    let mut headers = Vec::new();
+    let mut body_start_index = 0;
+
+    // Split the response into lines
+    let lines: Vec<&str> = response.lines().collect();
+
+    // Iterate over lines to parse headers
+    for (index, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            // Empty line indicates end of headers, body starts after this
+            body_start_index = index + 1;
+            break;
+        }
+
+        // Split each line into key-value pairs
+        if let Some(separator_index) = line.find(':') {
+            let key = line[..separator_index].trim().to_string();
+            let value = line[separator_index + 1..].trim().to_string();
+            headers.push((key, value));
+        }
+    }
+
+    (headers, body_start_index)
+}
+
+// Function to parse a single header line into key-value pair
+fn parse_header_line(line: &str) -> Option<(String, String)> {
+    if let Some(separator_index) = line.find(':') {
+        let key = line[..separator_index].trim().to_string();
+        let value = line[separator_index + 1..].trim().to_string();
+        Some((key, value))
+    } else {
+        None
+    }
 }
